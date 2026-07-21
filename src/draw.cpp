@@ -82,6 +82,8 @@ private:
     int highlight_color;
     uint32_t current_host = 0;
     size_t current_col = 0;
+    size_t scroll_offset = 0;
+    size_t visible_host_count = 0;
     bool sort_reversed = false;
     int next_color_id = 1;
     bool anonymize = false;
@@ -333,6 +335,24 @@ int NCursesInterface::processInput()
             }
         } else {
             current_host = host_order[0];
+        }
+        break;
+
+    case KEY_NPAGE:
+        if (!host_order.empty()) {
+            size_t page = visible_host_count > 1 ? visible_host_count - 1 : 1;
+            size_t cur_pos = cur_host ? cur_host->current_position : 0;
+            size_t new_pos = std::min(cur_pos + page, host_order.size() - 1);
+            current_host = host_order[new_pos];
+        }
+        break;
+
+    case KEY_PPAGE:
+        if (!host_order.empty()) {
+            size_t page = visible_host_count > 1 ? visible_host_count - 1 : 1;
+            size_t cur_pos = cur_host ? cur_host->current_position : 0;
+            size_t new_pos = cur_pos >= page ? cur_pos - page : 0;
+            current_host = host_order[new_pos];
         }
         break;
 
@@ -732,9 +752,15 @@ void NCursesInterface::doRender()
             std::sort(host_cache.begin(), host_cache.end(), compare);
     }
 
+    // Build pass: record host_order, positions, and per-host screen heights.
+    struct HostEntry {
+        std::shared_ptr<HostCache> cache;
+        int height; // number of screen rows this host occupies
+    };
+    std::vector<HostEntry> ordered_hosts;
     host_order.clear();
 
-    for (auto cache: host_cache) {
+    for (auto cache : host_cache) {
         auto &host = cache->host;
         if (!host->id)
             continue;
@@ -742,15 +768,64 @@ void NCursesInterface::doRender()
         host->current_position = host_order.size();
         host_order.push_back(host->id);
 
+        int height = 1;
+        if (host->expanded) {
+            height += static_cast<int>(host->getMaxJobs());
+            for (auto const &a : host->attr) {
+                if (get_anonymize() && (a.first == "Name" || a.first == "IP"))
+                    continue;
+                height++;
+            }
+        }
+
+        ordered_hosts.push_back({cache, height});
+    }
+
+    // Scroll adjustment: keep the selected host visible.
+    int list_rows = screen_rows - row; // rows available for the host list
+
+    // Clamp scroll_offset in case the host list shrank.
+    if (!ordered_hosts.empty() && scroll_offset >= ordered_hosts.size())
+        scroll_offset = ordered_hosts.size() - 1;
+    else if (ordered_hosts.empty())
+        scroll_offset = 0;
+
+    auto cur_host_ptr = Host::find(current_host);
+    if (cur_host_ptr) {
+        size_t cur_pos = cur_host_ptr->current_position;
+
+        // Scroll up if the selected host is above the viewport.
+        if (cur_pos < scroll_offset)
+            scroll_offset = cur_pos;
+
+        // Scroll down if the selected host is below (or its block extends past) the viewport.
+        // Accumulate heights from scroll_offset to cur_pos inclusive; if they exceed
+        // list_rows, advance scroll_offset until they fit.
+        while (scroll_offset < cur_pos) {
+            int visible_height = 0;
+            for (size_t i = scroll_offset; i <= cur_pos && i < ordered_hosts.size(); i++)
+                visible_height += ordered_hosts[i].height;
+            if (visible_height <= list_rows)
+                break;
+            scroll_offset++;
+        }
+    }
+
+    // Draw pass: render hosts starting at scroll_offset.
+    visible_host_count = 0;
+    for (size_t idx = scroll_offset; idx < ordered_hosts.size(); idx++) {
+        auto &entry = ordered_hosts[idx];
+        auto &host = entry.cache->host;
+
         move(row, 0);
         {
             Attr color(COLOR_PAIR(host->highlighted ? highlight_color : expand_color));
             addch(host->expanded ? '-' : '+');
         }
 
-        for (auto const &v: views) {
+        for (auto const &v : views) {
             if (v.col + v.width <= screen_cols)
-                v.column->output(row, v.col, v.width, cache);
+                v.column->output(row, v.col, v.width, entry.cache);
         }
 
         if (host->expanded) {
@@ -765,7 +840,7 @@ void NCursesInterface::doRender()
                 std::shared_ptr<Job> job;
 
                 // Find assigned job
-                for (auto j : cache->current_jobs) {
+                for (auto j : entry.cache->current_jobs) {
                     if (j.second->host_slot == i) {
                         job = j.second;
                         break;
@@ -774,7 +849,7 @@ void NCursesInterface::doRender()
 
                 // If no existing job was found, assign a new one
                 if (!job) {
-                    for (auto j : cache->current_jobs) {
+                    for (auto j : entry.cache->current_jobs) {
                         if (j.second->host_slot == SIZE_MAX) {
                             job = j.second;
                             j.second->host_slot = i;
@@ -823,6 +898,7 @@ void NCursesInterface::doRender()
                 addstr(a.second.c_str());
             }
         }
+        visible_host_count++;
         next_row();
     }
 }
